@@ -1,0 +1,5 @@
+-- CreateTable
+CREATE TABLE "MaskCounter" (
+    "date" DATETIME NOT NULL PRIMARY KEY DEFAULT CURRENT_TIMESTAMP,
+    "type" INTEGER NOT NULL
+);

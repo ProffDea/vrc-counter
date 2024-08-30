@@ -1,0 +1,41 @@
+[workspace]
+members = ["crates/*", "prisma"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["ProffDea <deatea@riseup.net>"]
+edition = "2021"
+license = "GPL-3.0-only"
+
+[workspace.dependencies]
+# chrono = "0.4.38"
+vrcc-core = { path = "./crates/core" }
+regex = "1.10.6"
+# strum = { version = "0.26.3", features = ["derive"] }
+tokio = { version = "1.38.0", features = ["macros", "rt-multi-thread"] }
+
+[package]
+name = "vrc-counter"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# async-stream = "0.3.5"
+# chrono.workspace = true
+vrcc-core.workspace = true
+futures = "0.3.30"
+iced = { version = "0.12.1", features = ["advanced", "tokio"] }
+lilt = "0.7.0"
+log = "0.4.22"
+regex.workspace = true
+rosc = "0.10.1"
+rust_decimal = "1.36.0"
+rust_decimal_macros = "1.36.0"
+# strum.workspace = true
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["json"] }
+tokio.workspace = true
+tracing-unwrap = "1.0.1"

@@ -1,0 +1,18 @@
+[package]
+name = "vrcc-core"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "vrcc_core"
+
+[dependencies]
+prisma-client-rust = { git = "https://github.com/Brendonovich/prisma-client-rust", rev = "4f9ef9d38ca732162accff72b2eb684d2f120bab", features = [
+	"migrations",
+	"sqlite",
+], default-features = false }
+regex.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+# strum.workspace = true

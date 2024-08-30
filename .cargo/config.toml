@@ -1,0 +1,3 @@
+[alias]
+prisma = "run -p prisma-cli --"
+chart = "run -p counter-plots --bin chart"

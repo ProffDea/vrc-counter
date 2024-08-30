@@ -1,0 +1,19 @@
+[package]
+name = "counter-plots"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "chart"
+
+[[bin]]
+name = "chart"
+
+[[bin]]
+name = "histogram"
+
+[dependencies]
+chrono.workspace = true
+vrcc-core.workspace = true
+plotters = "0.3.6"
+tokio.workspace = true
