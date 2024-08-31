@@ -27,7 +27,10 @@ license.workspace = true
 # chrono.workspace = true
 vrcc-core.workspace = true
 futures = "0.3.30"
-iced = { version = "0.12.1", features = ["advanced", "tokio"] }
+iced = { git = "https://github.com/iced-rs/iced", version = "0.13.0-dev", features = [
+	"advanced",
+	"tokio",
+] }
 lilt = "0.7.0"
 log = "0.4.22"
 regex.workspace = true

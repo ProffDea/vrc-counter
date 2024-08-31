@@ -1,25 +1,20 @@
 #![feature(let_chains)]
+// Prevents the terminal from opening on a release build.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod logger;
 
-use futures::{channel::mpsc::Sender, SinkExt};
+use futures::{channel::mpsc::Sender, SinkExt, Stream};
 use iced::{
-	executor,
 	widget::{button, container, scrollable, text, Column},
-	Application, Command, Element, Length, Settings, Subscription, Theme,
+	Element, Length, Subscription, Task, Theme,
 };
-use lilt::{Animated, Easing};
 use logger::Logger;
-use modal::Modal;
+use modal::modal;
 use rosc::{OscMessage, OscPacket, OscType};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use rust_decimal_macros::dec;
-use std::{
-	io,
-	sync::Arc,
-	time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 use tokio::net::UdpSocket;
 use tracing::{debug, error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -36,41 +31,68 @@ const MASK_ITERATION_PARAM: &str = "/avatar/parameters/mask_iteration";
 // TODO: add app icon
 // TODO: auto-detect avatar parameters: $env:USERPROFILE\AppData\LocalLow\VRChat\VRChat\OSC\{user_id}\Avatars\{avatar_id}.json
 fn main() -> iced::Result {
-	Counter::run(Settings::default())
+	iced::application("VRC Counter", Counter::update, Counter::view)
+		.theme(Counter::theme)
+		.subscription(Counter::subscription)
+		.run_with(Counter::new)
 }
 
+/// A blend tree is used inside the Unity Editor and uses a float parameter with a minimum range of
+/// negative one (-1) to a maximum range of positive one (+1). VRChat clamps remote parameters
+/// across the network to two decimal places (0.99). This gives a possible accurate range of 200
+/// values and this function is used to convert the integer form into the float that represents
+/// that integer by returning a `Decimal`.
+///
+/// Note that the function is not aware of a minimum/maximum range, therefore a `Decimal` can be
+/// returned with a value over positive one by giving a number greater than 200.
+///
+/// # Example
+///
+/// ```rust
+/// let num = 200;
+/// let dec = int_to_decimal(num).to_f32().unwrap();
+///
+/// assert_eq!(1.0, dec)
+/// ```
 fn int_to_decimal(num: usize) -> Decimal {
 	let output = Decimal::new(num as i64, 0) * dec!(0.01);
 	dec!(-1.0) + output
 }
 
 #[derive(Debug, Clone)]
-enum Message {
-	Event(Event),
-	ShowModal,
-	HideModal,
-	Tick,
+enum ScreenKind {
+	TestModal,
+}
+
+#[derive(Debug)]
+enum Screen {
+	TestModal(test_modal::TestModal),
+}
+
+#[derive(Debug, Clone)]
+enum Event {
+	CounterUpdated,
+	Log(String),
 }
 
 #[derive(Debug)]
 struct Counter {
 	state: vrcc_core::State,
 	mask_counter: usize,
-	show_modal: Animated<bool, Instant>,
+	modal: Option<Screen>,
 	logs: Vec<String>,
 }
 
-impl Application for Counter {
-	type Message = Message;
-	type Theme = Theme;
-	type Executor = executor::Default;
-	type Flags = ();
+#[derive(Debug, Clone)]
+enum Message {
+	Event(Event),
+	ModalChanged(ScreenKind),
+	ModalClosed,
+	TestModal(test_modal::Message),
+}
 
-	fn theme(&self) -> Self::Theme {
-		iced::Theme::CatppuccinFrappe
-	}
-
-	fn new(_flags: ()) -> (Self, Command<Message>) {
+impl Counter {
+	fn new() -> (Self, Task<Message>) {
 		let state = futures::executor::block_on(vrcc_core::State::new());
 
 		let db = &state.db;
@@ -81,53 +103,55 @@ impl Application for Counter {
 			Counter {
 				state,
 				mask_counter: data.len(),
-				show_modal: Animated::new(false)
-					.duration(100.)
-					.easing(Easing::EaseOut)
-					.delay(0.),
+				modal: None,
 				logs: Vec::new(),
 			},
-			Command::none(),
+			Task::none(),
 		)
 	}
 
-	fn title(&self) -> String {
-		String::from("Counter")
-	}
-
-	fn update(&mut self, message: Message) -> Command<Message> {
-		let now = Instant::now();
-
+	fn update(&mut self, message: Message) -> Task<Message> {
 		match message {
 			Message::Event(event) => match event {
 				Event::CounterUpdated => {
 					self.mask_counter += 1;
-					Command::none()
+					Task::none()
 				}
 				Event::Log(value) => {
 					self.logs.push(value);
-					Command::none()
+					Task::none()
 				}
 			},
-			Message::ShowModal => {
-				info!("Showing modal!");
-				self.show_modal.transition(true, now);
-				iced::widget::focus_next()
+			Message::ModalChanged(kind) => match kind {
+				ScreenKind::TestModal => {
+					self.modal = Some(Screen::TestModal(test_modal::TestModal::new()));
+					Task::none()
+				}
+			},
+			Message::ModalClosed => {
+				self.modal = None;
+				Task::none()
 			}
-			Message::HideModal => {
-				info!("Hiding modal!");
-				self.show_modal.transition(false, now);
-				Command::none()
+			Message::TestModal(message) => {
+				let Some(screen) = &mut self.modal else {
+					return Task::none();
+				};
+				match screen {
+					Screen::TestModal(test) => {
+						test.update(message);
+						Task::none()
+					}
+					_ => Task::none(),
+				}
 			}
-			Message::Tick => Command::none(),
 		}
 	}
 
 	fn view(&self) -> Element<Message> {
-		let now = Instant::now();
-
 		let col = Column::new().push(text(self.mask_counter));
-		let col = col.push(button(text("Show modal")).on_press(Message::ShowModal));
+		let col = col.push(
+			button(text("Test Modal")).on_press(Message::ModalChanged(ScreenKind::TestModal)),
+		);
 
 		let log_con = container(scrollable(Column::from_vec(
 			self.logs.iter().map(|log| text(log).into()).collect(),
@@ -138,16 +162,338 @@ impl Application for Counter {
 
 		let con = container(col).width(Length::Fill).height(Length::Fill);
 
-		if self.show_modal.in_progress(now) || self.show_modal.value {
-			let mut text_color = iced::theme::palette::Palette::CATPPUCCIN_FRAPPE.text;
-			text_color.a = self.show_modal.animate_bool(0., 1., now);
-			let mut bg_color = iced::theme::palette::Palette::CATPPUCCIN_FRAPPE.background;
-			bg_color.a = self.show_modal.animate_bool(0., 1., now);
+		if let Some(screen) = &self.modal {
+			match screen {
+				Screen::TestModal(test) => modal(con, test.view().map(Message::TestModal), || {
+					Message::ModalClosed
+				}),
+				_ => con.into(),
+			}
+		} else {
+			con.into()
+		}
+	}
 
-			let modal = container(Column::new().push(text("Hello modal!")).spacing(20))
+	fn subscription(&self) -> iced::Subscription<Message> {
+		let sub_logger = Subscription::run(log_stream).map(Message::Event);
+
+		struct Listen;
+		let sub_counter =
+			Subscription::run_with_id(std::any::TypeId::of::<Listen>(), self.counter_stream())
+				.map(Message::Event);
+
+		Subscription::batch([sub_logger, sub_counter])
+	}
+
+	fn counter_stream(&self) -> impl Stream<Item = Event> {
+		let db = Arc::clone(&self.state.db);
+		let avatar_params = self.state.config.avatar_params.clone();
+
+		// TODO: refactor redundant code
+		// TODO: handle all unwraps to print to stdout ideally in a func that returns result
+		iced::stream::channel(0, |mut tx: Sender<Event>| async move {
+			// TODO: handle AddrInUse error
+			let socket = UdpSocket::bind("127.0.0.1:9001").await.unwrap();
+
+			// NOTE: get the start of the current day
+			// let start_cur_date = Local::now()
+			// 	.fixed_offset()
+			// 	.with_hour(0)
+			// 	.unwrap()
+			// 	.with_minute(0)
+			// 	.unwrap()
+			// 	.with_second(0)
+			// 	.unwrap()
+			// 	.with_nanosecond(0)
+			// 	.unwrap();
+
+			let mut data_len = db
+				.mask_counter()
+				.find_many(vec![
+					// NOTE: only select records within the current day and grabbed instead of posed
+					// mask_counter::date::gt(start_cur_date),
+					// mask_counter::WhereParam::Or(vec![
+					// 	mask_counter::r#type::equals(
+					// 		Mask::UpGrabbed(Regex::new("").unwrap()).discriminant() as i32,
+					// 	),
+					// 	mask_counter::r#type::equals(
+					// 		Mask::DownGrabbed(Regex::new("").unwrap()).discriminant() as i32,
+					// 	),
+					// ]),
+				])
+				.exec()
+				.await
+				.unwrap()
+				.len();
+			let mut iteration_amount = 0;
+
+			let mut buf = [0u8; rosc::decoder::MTU];
+			loop {
+				if data_len >= 200 {
+					info!("Setting iteration_amount and data_len!");
+					info!("iteration_amount: {}", iteration_amount);
+					info!("data_len: {}", data_len);
+					iteration_amount += data_len / 200;
+					data_len %= 200;
+					info!("iteration_amount: {}", iteration_amount);
+					info!("data_len: {}", data_len);
+					let output = int_to_decimal(iteration_amount);
+					let iteration_buf = rosc::encoder::encode(&OscPacket::Message(OscMessage {
+						addr: String::from(MASK_ITERATION_PARAM),
+						args: vec![OscType::Float(output.to_f32().unwrap())],
+					}))
+					.unwrap();
+					socket
+						.send_to(&iteration_buf, "127.0.0.1:9000")
+						.await
+						.unwrap_or_log();
+				}
+				match socket.recv_from(&mut buf).await {
+					Ok((size, addr)) => {
+						debug!("Received packet with size {} from: {}", &size, &addr);
+						let (_, packet) = rosc::decoder::decode_udp(&buf[..size]).unwrap();
+						match packet {
+							OscPacket::Message(msg) => {
+								debug!("OSC address: {}", &msg.addr);
+								debug!("OSC arguments: {:?}", &msg.args);
+								if let Some(arg) = msg.args.first()
+									&& let OscType::Bool(value) = arg
+									&& *value
+								{
+									let addr = msg.addr.as_str();
+									for param in &avatar_params {
+										match param {
+											Mask::UpPosed(regex) => {
+												if regex.find(addr).is_some() {
+													info!("posed up!");
+
+													if let Err(e) = db
+														.mask_counter()
+														.create(
+															param.discriminant() as i32,
+															Vec::new(),
+														)
+														.exec()
+														.await
+													{
+														error!("{}", e);
+													} else {
+														tx.send(Event::CounterUpdated)
+															.await
+															.unwrap();
+													}
+												}
+											}
+											Mask::DownPosed(regex) => {
+												if regex.find(addr).is_some() {
+													info!("posed down!");
+													if let Err(e) = db
+														.mask_counter()
+														.create(
+															param.discriminant() as i32,
+															Vec::new(),
+														)
+														.exec()
+														.await
+													{
+														error!("{}", e);
+													} else {
+														tx.send(Event::CounterUpdated)
+															.await
+															.unwrap();
+													}
+												}
+											}
+											Mask::UpGrabbed(regex) => {
+												if regex.find(addr).is_some() {
+													info!("grabbed up!");
+													if let Err(e) = db
+														.mask_counter()
+														.create(
+															param.discriminant() as i32,
+															Vec::new(),
+														)
+														.exec()
+														.await
+													{
+														error!("{}", e);
+													} else {
+														data_len += 1;
+
+														let output = int_to_decimal(data_len);
+														info!("output: {}", output);
+														info!("from address: {}", &msg.addr);
+														info!(
+															"affected address: {}",
+															MASK_COUNTER_PARAM
+														);
+
+														let counter_buf = rosc::encoder::encode(
+															&OscPacket::Message(OscMessage {
+																addr: String::from(
+																	MASK_COUNTER_PARAM,
+																),
+																args: vec![OscType::Float(
+																	output.to_f32().unwrap(),
+																)],
+															}),
+														)
+														.unwrap();
+														if let Err(e) = socket
+															.send_to(&counter_buf, "127.0.0.1:9000")
+															.await
+														{
+															error!("{}", e);
+														}
+
+														tx.send(Event::CounterUpdated)
+															.await
+															.unwrap();
+													}
+												}
+											}
+											Mask::DownGrabbed(regex) => {
+												if regex.find(addr).is_some() {
+													info!("grabbed down!");
+													if let Err(e) = db
+														.mask_counter()
+														.create(
+															param.discriminant() as i32,
+															Vec::new(),
+														)
+														.exec()
+														.await
+													{
+														error!("{}", e);
+													} else {
+														data_len += 1;
+
+														let output = int_to_decimal(data_len);
+														info!("output: {}", output);
+														info!("from address: {}", &msg.addr);
+														info!(
+															"affected address: {}",
+															MASK_COUNTER_PARAM
+														);
+
+														let counter_buf = rosc::encoder::encode(
+															&OscPacket::Message(OscMessage {
+																addr: String::from(
+																	MASK_COUNTER_PARAM,
+																),
+																args: vec![OscType::Float(
+																	output.to_f32().unwrap(),
+																)],
+															}),
+														)
+														.unwrap();
+														if let Err(e) = socket
+															.send_to(&counter_buf, "127.0.0.1:9000")
+															.await
+														{
+															error!("{}", e);
+														}
+
+														tx.send(Event::CounterUpdated)
+															.await
+															.unwrap();
+													}
+												}
+											}
+										}
+									}
+								} else if msg.addr == "/avatar/change" {
+									// TODO: configure avatar ids
+
+									let output = int_to_decimal(data_len);
+									info!("output: {}", output);
+									info!("from address: {}", &msg.addr);
+									info!("affected address: {}", MASK_COUNTER_PARAM);
+
+									let counter_buf =
+										rosc::encoder::encode(&OscPacket::Message(OscMessage {
+											addr: String::from(MASK_COUNTER_PARAM),
+											args: vec![OscType::Float(output.to_f32().unwrap())],
+										}))
+										.unwrap();
+									if let Err(e) =
+										socket.send_to(&counter_buf, "127.0.0.1:9000").await
+									{
+										error!("{}", e);
+									}
+									info!("iteration_amount: {}", iteration_amount);
+									let output = int_to_decimal(iteration_amount);
+									let iteration_buf =
+										rosc::encoder::encode(&OscPacket::Message(OscMessage {
+											addr: String::from(MASK_ITERATION_PARAM),
+											args: vec![OscType::Float(output.to_f32().unwrap())],
+										}))
+										.unwrap();
+									if let Err(e) =
+										socket.send_to(&iteration_buf, "127.0.0.1:9000").await
+									{
+										error!("{}", e);
+									}
+								}
+							}
+							OscPacket::Bundle(bundle) => {
+								debug!("OSC Bundle: {:?}", &bundle);
+							}
+						}
+					}
+					Err(e) => {
+						error!("Error receiving from socket: {}", e);
+					}
+				}
+			}
+		})
+	}
+
+	fn theme(&self) -> Theme {
+		Theme::CatppuccinFrappe
+	}
+}
+
+fn log_stream() -> impl Stream<Item = Event> {
+	iced::stream::channel(0, |tx: Sender<Event>| async move {
+		tracing_subscriber::registry()
+			.with(Logger::new(tx).with_max_level(tracing::Level::INFO))
+			.init();
+
+		loop {
+			tokio::time::sleep(Duration::new(1, 0)).await;
+		}
+	})
+}
+
+// TODO: move modules into their own files
+mod test_modal {
+	use iced::{
+		widget::{container, text, Column},
+		Element,
+	};
+
+	#[derive(Debug)]
+	pub struct TestModal;
+
+	#[derive(Debug, Clone)]
+	pub enum Message {}
+
+	impl TestModal {
+		pub fn new() -> Self {
+			Self {}
+		}
+
+		pub fn update(&mut self, _message: Message) {}
+
+		pub fn view(&self) -> Element<Message> {
+			let text_color = iced::theme::palette::Palette::CATPPUCCIN_FRAPPE.text;
+			let bg_color = iced::theme::palette::Palette::CATPPUCCIN_FRAPPE.background;
+
+			container(Column::new().push(text("Hello modal!")).spacing(20))
 				.width(300)
 				.padding(10)
-				.style(container::Appearance {
+				.style(move |_theme| container::Style {
 					text_color: Some(text_color),
 					background: Some(iced::Background::Color(bg_color)),
 					border: iced::Border {
@@ -155,418 +501,16 @@ impl Application for Counter {
 						..Default::default()
 					},
 					..Default::default()
-				});
-
-			Modal::new(con, modal, self.show_modal.clone())
-				.on_blur(Message::HideModal)
+				})
 				.into()
-		} else {
-			con.into()
 		}
 	}
-
-	fn subscription(&self) -> iced::Subscription<Message> {
-		let now = Instant::now();
-
-		struct ListenLogger;
-		let sub_logger = iced::subscription::channel(
-			std::any::TypeId::of::<ListenLogger>(),
-			0,
-			|tx: Sender<Event>| async move {
-				tracing_subscriber::registry()
-					.with(Logger::new(tx).with_max_level(tracing::Level::INFO))
-					.init();
-
-				loop {
-					tokio::time::sleep(Duration::new(1, 0)).await;
-				}
-			},
-		)
-		.map(Message::Event);
-
-		let sub_animate = if self.show_modal.in_progress(now) {
-			iced::window::frames().map(|_| Message::Tick)
-		} else {
-			Subscription::none()
-		};
-
-		struct Listen;
-		let db = Arc::clone(&self.state.db);
-		let avatar_params = self.state.config.avatar_params.clone();
-		// TODO: handle all unwraps to print to stdout ideally in a func that returns result
-		let sub_counter = iced::subscription::channel(
-			std::any::TypeId::of::<Listen>(),
-			0,
-			|mut tx: Sender<Event>| async move {
-				// TODO: handle AddrInUse error
-				let socket = UdpSocket::bind("127.0.0.1:9001").await.unwrap();
-
-				// let start_cur_date = Local::now()
-				// 	.fixed_offset()
-				// 	.with_hour(0)
-				// 	.unwrap()
-				// 	.with_minute(0)
-				// 	.unwrap()
-				// 	.with_second(0)
-				// 	.unwrap()
-				// 	.with_nanosecond(0)
-				// 	.unwrap();
-
-				let mut data_len = db
-					.mask_counter()
-					.find_many(vec![
-						// mask_counter::date::gt(start_cur_date),
-						// mask_counter::WhereParam::Or(vec![
-						// 	mask_counter::r#type::equals(
-						// 		Mask::UpGrabbed(Regex::new("").unwrap()).discriminant() as i32,
-						// 	),
-						// 	mask_counter::r#type::equals(
-						// 		Mask::DownGrabbed(Regex::new("").unwrap()).discriminant() as i32,
-						// 	),
-						// ]),
-					])
-					.exec()
-					.await
-					.unwrap()
-					.len();
-				let mut iteration_amount = 0;
-
-				let mut buf = [0u8; rosc::decoder::MTU];
-				loop {
-					if data_len >= 200 {
-						info!("Setting iteration_amount and data_len!");
-						info!("iteration_amount: {}", iteration_amount);
-						info!("data_len: {}", data_len);
-						iteration_amount += data_len / 200;
-						data_len %= 200;
-						info!("iteration_amount: {}", iteration_amount);
-						info!("data_len: {}", data_len);
-						let output = int_to_decimal(iteration_amount);
-						let iteration_buf =
-							rosc::encoder::encode(&OscPacket::Message(OscMessage {
-								addr: String::from(MASK_ITERATION_PARAM),
-								args: vec![OscType::Float(output.to_f32().unwrap())],
-							}))
-							.unwrap();
-						socket
-							.send_to(&iteration_buf, "127.0.0.1:9000")
-							.await
-							.unwrap_or_log();
-					}
-					match socket.recv_from(&mut buf).await {
-						Ok((size, addr)) => {
-							debug!("Received packet with size {} from: {}", &size, &addr);
-							let (_, packet) = rosc::decoder::decode_udp(&buf[..size]).unwrap();
-							match packet {
-								OscPacket::Message(msg) => {
-									debug!("OSC address: {}", &msg.addr);
-									debug!("OSC arguments: {:?}", &msg.args);
-									if let Some(arg) = msg.args.first()
-										&& let OscType::Bool(value) = arg
-										&& *value
-									{
-										let addr = msg.addr.as_str();
-										for param in &avatar_params {
-											match param {
-												Mask::UpPosed(regex) => {
-													if regex.find(addr).is_some() {
-														info!("posed up!");
-
-														if let Err(e) = db
-															.mask_counter()
-															.create(
-																param.discriminant() as i32,
-																Vec::new(),
-															)
-															.exec()
-															.await
-														{
-															error!("{}", e);
-														} else {
-															// data_len += 1;
-
-															// let output = int_to_decimal(data_len);
-															// info!("output: {}", output);
-															// info!("from address: {}", &msg.addr);
-															// info!(
-															// 	"affected address: {}",
-															// 	MASK_COUNTER_PARAM
-															// );
-															//
-															// let msg_buf = rosc::encoder::encode(
-															// 	&OscPacket::Message(OscMessage {
-															// 		addr: String::from(
-															// 			MASK_COUNTER_PARAM,
-															// 		),
-															// 		args: vec![OscType::Float(
-															// 			output.to_f32().unwrap(),
-															// 		)],
-															// 	}),
-															// )
-															// .unwrap();
-
-															// let msg_buf = rosc::encoder::encode(
-															// 	&OscPacket::Message(OscMessage {
-															// 		addr: String::from(
-															// 			MASK_COUNTER_PARAM,
-															// 		),
-															// 		args: vec![OscType::Float(
-															// 			-0.8,
-															// 		)],
-															// 	}),
-															// )
-															// .unwrap();
-															// if let Err(e) = socket
-															// 	.send_to(&msg_buf, "127.0.0.1:9000")
-															// {
-															// 	error!("{}", e);
-															// }
-
-															tx.send(Event::CounterUpdated)
-																.await
-																.unwrap();
-														}
-													}
-												}
-												Mask::DownPosed(regex) => {
-													if regex.find(addr).is_some() {
-														info!("posed down!");
-														if let Err(e) = db
-															.mask_counter()
-															.create(
-																param.discriminant() as i32,
-																Vec::new(),
-															)
-															.exec()
-															.await
-														{
-															error!("{}", e);
-														} else {
-															// data_len += 1;
-															//
-															// let output = int_to_decimal(data_len);
-															// info!("output: {}", output);
-															// info!("from address: {}", &msg.addr);
-															// info!(
-															// 	"affected address: {}",
-															// 	MASK_COUNTER_PARAM
-															// );
-															//
-															// let msg_buf = rosc::encoder::encode(
-															// 	&OscPacket::Message(OscMessage {
-															// 		addr: String::from(
-															// 			MASK_COUNTER_PARAM,
-															// 		),
-															// 		args: vec![OscType::Float(
-															// 			output.to_f32().unwrap(),
-															// 		)],
-															// 	}),
-															// )
-															// .unwrap();
-															//
-															// if let Err(e) = socket
-															// 	.send_to(&msg_buf, "127.0.0.1:9000")
-															// {
-															// 	error!("{}", e);
-															// }
-
-															tx.send(Event::CounterUpdated)
-																.await
-																.unwrap();
-														}
-													}
-												}
-												Mask::UpGrabbed(regex) => {
-													if regex.find(addr).is_some() {
-														info!("grabbed up!");
-														if let Err(e) = db
-															.mask_counter()
-															.create(
-																param.discriminant() as i32,
-																Vec::new(),
-															)
-															.exec()
-															.await
-														{
-															error!("{}", e);
-														} else {
-															data_len += 1;
-
-															let output = int_to_decimal(data_len);
-															info!("output: {}", output);
-															info!("from address: {}", &msg.addr);
-															info!(
-																"affected address: {}",
-																MASK_COUNTER_PARAM
-															);
-
-															let counter_buf =
-																rosc::encoder::encode(
-																	&OscPacket::Message(
-																		OscMessage {
-																			addr: String::from(
-																				MASK_COUNTER_PARAM,
-																			),
-																			args: vec![
-																				OscType::Float(
-																					output
-																						.to_f32()
-																						.unwrap(),
-																				),
-																			],
-																		},
-																	),
-																)
-																.unwrap();
-															if let Err(e) = socket
-																.send_to(
-																	&counter_buf,
-																	"127.0.0.1:9000",
-																)
-																.await
-															{
-																error!("{}", e);
-															}
-
-															tx.send(Event::CounterUpdated)
-																.await
-																.unwrap();
-														}
-													}
-												}
-												Mask::DownGrabbed(regex) => {
-													if regex.find(addr).is_some() {
-														info!("grabbed down!");
-														if let Err(e) = db
-															.mask_counter()
-															.create(
-																param.discriminant() as i32,
-																Vec::new(),
-															)
-															.exec()
-															.await
-														{
-															error!("{}", e);
-														} else {
-															data_len += 1;
-
-															let output = int_to_decimal(data_len);
-															info!("output: {}", output);
-															info!("from address: {}", &msg.addr);
-															info!(
-																"affected address: {}",
-																MASK_COUNTER_PARAM
-															);
-
-															let counter_buf =
-																rosc::encoder::encode(
-																	&OscPacket::Message(
-																		OscMessage {
-																			addr: String::from(
-																				MASK_COUNTER_PARAM,
-																			),
-																			args: vec![
-																				OscType::Float(
-																					output
-																						.to_f32()
-																						.unwrap(),
-																				),
-																			],
-																		},
-																	),
-																)
-																.unwrap();
-															if let Err(e) = socket
-																.send_to(
-																	&counter_buf,
-																	"127.0.0.1:9000",
-																)
-																.await
-															{
-																error!("{}", e);
-															}
-
-															tx.send(Event::CounterUpdated)
-																.await
-																.unwrap();
-														}
-													}
-												}
-											}
-										}
-									} else if msg.addr == "/avatar/change" {
-										// TODO: configure avatar ids
-
-										let output = int_to_decimal(data_len);
-										info!("output: {}", output);
-										info!("from address: {}", &msg.addr);
-										info!("affected address: {}", MASK_COUNTER_PARAM);
-
-										let counter_buf = rosc::encoder::encode(
-											&OscPacket::Message(OscMessage {
-												addr: String::from(MASK_COUNTER_PARAM),
-												args: vec![OscType::Float(
-													output.to_f32().unwrap(),
-												)],
-											}),
-										)
-										.unwrap();
-										if let Err(e) =
-											socket.send_to(&counter_buf, "127.0.0.1:9000").await
-										{
-											error!("{}", e);
-										}
-										info!("iteration_amount: {}", iteration_amount);
-										let output = int_to_decimal(iteration_amount);
-										let iteration_buf = rosc::encoder::encode(
-											&OscPacket::Message(OscMessage {
-												addr: String::from(MASK_ITERATION_PARAM),
-												args: vec![OscType::Float(
-													output.to_f32().unwrap(),
-												)],
-											}),
-										)
-										.unwrap();
-										if let Err(e) =
-											socket.send_to(&iteration_buf, "127.0.0.1:9000").await
-										{
-											error!("{}", e);
-										}
-									}
-								}
-								OscPacket::Bundle(bundle) => {
-									debug!("OSC Bundle: {:?}", &bundle);
-								}
-							}
-						}
-						Err(e) => {
-							error!("Error receiving from socket: {}", e);
-						}
-					}
-				}
-			},
-		)
-		.map(Message::Event);
-
-		Subscription::batch([sub_logger, sub_animate, sub_counter])
-	}
 }
 
-#[derive(Debug, Default, Clone)]
-enum State {
-	#[default]
-	Disconnected,
-	Connected,
-}
-
-#[derive(Debug, Clone)]
-enum Event {
-	CounterUpdated,
-	Log(String),
-}
-
+// TODO: add animations with lilt
 mod modal {
-	use std::time::Instant;
+	//! License SPDX: GPL-3.0-only
+	//! Source: https://github.com/squidowl/halloy/blob/main/src/widget/modal.rs
 
 	use iced::advanced::layout::{self, Layout};
 	use iced::advanced::overlay;
@@ -574,16 +518,29 @@ mod modal {
 	use iced::advanced::widget::{self, Widget};
 	use iced::advanced::{self, Clipboard, Shell};
 	use iced::alignment::Alignment;
-	use iced::event;
+	use iced::keyboard::key;
 	use iced::mouse;
+	use iced::{event, keyboard};
 	use iced::{Color, Element, Event, Length, Point, Rectangle, Size, Vector};
+
+	pub fn modal<'a, Message, Theme, Renderer>(
+		base: impl Into<Element<'a, Message, Theme, Renderer>>,
+		modal: impl Into<Element<'a, Message, Theme, Renderer>>,
+		on_blur: impl Fn() -> Message + 'a,
+	) -> Element<'a, Message, Theme, Renderer>
+	where
+		Theme: 'a,
+		Renderer: 'a + advanced::Renderer,
+		Message: 'a,
+	{
+		Modal::new(base, modal, on_blur).into()
+	}
 
 	/// A widget that centers a modal element over some base element
 	pub struct Modal<'a, Message, Theme, Renderer> {
 		base: Element<'a, Message, Theme, Renderer>,
 		modal: Element<'a, Message, Theme, Renderer>,
-		on_blur: Option<Message>,
-		animated: lilt::Animated<bool, Instant>,
+		on_blur: Box<dyn Fn() -> Message + 'a>,
 	}
 
 	impl<'a, Message, Theme, Renderer> Modal<'a, Message, Theme, Renderer> {
@@ -591,22 +548,12 @@ mod modal {
 		pub fn new(
 			base: impl Into<Element<'a, Message, Theme, Renderer>>,
 			modal: impl Into<Element<'a, Message, Theme, Renderer>>,
-			animated: lilt::Animated<bool, Instant>,
+			on_blur: impl Fn() -> Message + 'a,
 		) -> Self {
 			Self {
 				base: base.into(),
 				modal: modal.into(),
-				on_blur: None,
-				animated,
-			}
-		}
-
-		/// Sets the message that will be produces when the background
-		/// of the [`Modal`] is pressed
-		pub fn on_blur(self, on_blur: Message) -> Self {
-			Self {
-				on_blur: Some(on_blur),
-				..self
+				on_blur: Box::new(on_blur),
 			}
 		}
 	}
@@ -615,7 +562,6 @@ mod modal {
 		for Modal<'a, Message, Theme, Renderer>
 	where
 		Renderer: advanced::Renderer,
-		Message: Clone,
 	{
 		fn children(&self) -> Vec<widget::Tree> {
 			vec![
@@ -699,8 +645,7 @@ mod modal {
 				content: &mut self.modal,
 				tree: &mut state.children[1],
 				size: layout.bounds().size(),
-				on_blur: self.on_blur.clone(),
-				animated: self.animated.clone(),
+				on_blur: &self.on_blur,
 			})))
 		}
 
@@ -726,7 +671,7 @@ mod modal {
 			state: &mut widget::Tree,
 			layout: Layout<'_>,
 			renderer: &Renderer,
-			operation: &mut dyn widget::Operation<Message>,
+			operation: &mut dyn widget::Operation<()>,
 		) {
 			self.base
 				.as_widget()
@@ -739,15 +684,13 @@ mod modal {
 		content: &'b mut Element<'a, Message, Theme, Renderer>,
 		tree: &'b mut widget::Tree,
 		size: Size,
-		on_blur: Option<Message>,
-		animated: lilt::Animated<bool, Instant>,
+		on_blur: &'b dyn Fn() -> Message,
 	}
 
 	impl<'a, 'b, Message, Theme, Renderer> overlay::Overlay<Message, Theme, Renderer>
 		for Overlay<'a, 'b, Message, Theme, Renderer>
 	where
 		Renderer: advanced::Renderer,
-		Message: Clone,
 	{
 		fn layout(&mut self, renderer: &Renderer, _bounds: Size) -> layout::Node {
 			let limits = layout::Limits::new(Size::ZERO, self.size)
@@ -772,15 +715,23 @@ mod modal {
 			clipboard: &mut dyn Clipboard,
 			shell: &mut Shell<'_, Message>,
 		) -> event::Status {
-			let content_bounds = layout.children().next().unwrap().bounds();
+			match event {
+				Event::Keyboard(keyboard::Event::KeyPressed {
+					key: keyboard::Key::Named(key::Named::Escape),
+					..
+				}) => {
+					shell.publish((self.on_blur)());
+					return event::Status::Captured;
+				}
+				Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+					let bounds = layout.children().next().unwrap().bounds();
 
-			if let Some(message) = self.on_blur.as_ref() {
-				if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = &event {
-					if !cursor.is_over(content_bounds) {
-						shell.publish(message.clone());
+					if !cursor.is_over(bounds) {
+						shell.publish((self.on_blur)());
 						return event::Status::Captured;
 					}
 				}
+				_ => {}
 			}
 
 			self.content.as_widget_mut().on_event(
@@ -803,15 +754,13 @@ mod modal {
 			layout: Layout<'_>,
 			cursor: mouse::Cursor,
 		) {
-			let now = Instant::now();
-
 			renderer.fill_quad(
 				renderer::Quad {
 					bounds: layout.bounds(),
 					..renderer::Quad::default()
 				},
 				Color {
-					a: self.animated.animate_bool(0., 0.8, now),
+					a: 0.80,
 					..Color::BLACK
 				},
 			);
@@ -831,7 +780,7 @@ mod modal {
 			&mut self,
 			layout: Layout<'_>,
 			renderer: &Renderer,
-			operation: &mut dyn widget::Operation<Message>,
+			operation: &mut dyn widget::Operation<()>,
 		) {
 			self.content.as_widget().operate(
 				self.tree,
@@ -875,8 +824,8 @@ mod modal {
 		for Element<'a, Message, Theme, Renderer>
 	where
 		Theme: 'a,
-		Message: 'a + Clone,
 		Renderer: 'a + advanced::Renderer,
+		Message: 'a,
 	{
 		fn from(modal: Modal<'a, Message, Theme, Renderer>) -> Self {
 			Element::new(modal)
