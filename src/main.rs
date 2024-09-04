@@ -148,29 +148,30 @@ impl Counter {
 	}
 
 	fn view(&self) -> Element<Message> {
-		let col = Column::new().push(text(self.mask_counter));
-		let col = col.push(
-			button(text("Test Modal")).on_press(Message::ModalChanged(ScreenKind::TestModal)),
-		);
+		let counter_text = text(self.mask_counter);
+		let modal_button =
+			button(text("Test Modal")).on_press(Message::ModalChanged(ScreenKind::TestModal));
 
-		let log_con = container(scrollable(Column::from_vec(
+		let content = container(Column::new().push(counter_text).push(modal_button));
+
+		let logs = container(scrollable(Column::from_vec(
 			self.logs.iter().map(|log| text(log).into()).collect(),
 		)))
 		.width(Length::Fill)
 		.height(Length::Fill);
-		let col = col.push(log_con);
 
-		let con = container(col).width(Length::Fill).height(Length::Fill);
+		let root_column = Column::new().push(content).push(logs);
+		let root_container = container(root_column)
+			.width(Length::Fill)
+			.height(Length::Fill);
 
 		if let Some(screen) = &self.modal {
-			match screen {
-				Screen::TestModal(test) => modal(con, test.view().map(Message::TestModal), || {
-					Message::ModalClosed
-				}),
-				_ => con.into(),
-			}
+			let Screen::TestModal(test) = screen;
+			modal(root_container, test.view().map(Message::TestModal), || {
+				Message::ModalClosed
+			})
 		} else {
-			con.into()
+			root_container.into()
 		}
 	}
 
